@@ -1,0 +1,88 @@
+import requests
+import threading
+import time
+import logging
+from datetime import datetime
+from queue import Queue
+
+logger = logging.getLogger(__name__)
+
+class TokenService:
+    def __init__(self):
+        self.token = None
+        self.token_expiry = None
+        self.token_queue = Queue()
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.lock = threading.Lock()
+
+    def login(self):
+        try:
+            logger.info("Attempting to login...")
+            response = requests.post(
+                'https://dummyjson.com/auth/login',
+                headers={'Content-Type': 'application/json'},
+                json={
+                    'username': 'emilys',
+                    'password': 'emilyspass',
+                    'expiresInMins': 1
+                },
+                timeout=10
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            with self.lock:
+                self.token = data.get('accessToken')
+                self.token_expiry = time.time() + 60
+                logger.info(f"New token obtained: {self.token}")
+                logger.info(f"Token expiry: {datetime.fromtimestamp(self.token_expiry).strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Login failed: {e}")
+            return False
+
+    def token_manager(self):
+        threading.current_thread().name = "TokenManager"
+        while not self.stop_event.is_set():
+            try:
+                with self.lock:
+                    if not self.token or (self.token_expiry and time.time() >= self.token_expiry - 10):
+                        logger.info("Token needs renewal...")
+                        if not self.login():
+                            logger.error("Failed to renew token")
+                            time.sleep(5)
+                            continue
+                
+                self.token_queue.put(self.token)
+                time.sleep(5)
+            except Exception as e:
+                logger.error(f"Error in token manager: {e}")
+                time.sleep(5)
+
+    def start(self):
+        if not self.login():
+            logger.error("Initial login failed")
+            return False
+        
+        self.thread = threading.Thread(target=self.token_manager, name="TokenManager")
+        self.thread.daemon = True
+        self.thread.start()
+        logger.info("Token service started")
+        return True
+
+    def stop(self):
+        self.stop_event.set()
+        if self.thread:
+            self.thread.join()
+        logger.info("Token service stopped")
+
+    def get_token(self):
+        try:
+            token = self.token_queue.get(timeout=10)
+            logger.info(f"Retrieved token from queue: {token}")
+            return token
+        except:
+            logger.error("Timeout waiting for token")
+            return None 

@@ -1,0 +1,304 @@
+import requests
+import threading
+import time
+import logging
+from datetime import datetime
+import random  # Usado para jitter no backoff
+# Removido: import queue
+
+# Supondo que AUTH_CONFIG está definido em algum lugar, como:
+# from config.settings import AUTH_CONFIG
+# Exemplo de como AUTH_CONFIG pode ser:
+AUTH_CONFIG = {
+    'username': 'your_username',
+    'password': 'your_password',
+    'token_expiry_minutes': 30 # IMPORTANTE: O código calcula baseado nisso
+}
+
+logger = logging.getLogger(__name__)
+# Configuração básica de logging se ainda não foi feita externamente
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
+
+
+class TokenService:
+    def __init__(self):
+        self.token = None
+        self.token_expiry = None  # Timestamp (float) de quando expira
+        # Removido: self.token_queue = queue.Queue(maxsize=1)
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.lock = threading.Lock()
+        self._initial_login_attempted = False
+        self._initial_login_successful = False
+
+    def login(self):
+        """
+        Tenta fazer login e obter um novo token.
+        Atualiza self.token e self.token_expiry DIRETAMENTE sob o lock.
+        Retorna o novo token em caso de sucesso, None caso contrário.
+        """
+        try:
+            logger.debug("Attempting to login...")
+            url = 'https://dummyjson.com/auth/login' # Use sua URL real aqui
+            payload = {
+                'username': AUTH_CONFIG['username'],
+                'password': AUTH_CONFIG['password'],
+                'expiresInMins': AUTH_CONFIG['token_expiry_minutes']
+            }
+            headers = {'Content-Type': 'application/json'}
+
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=15
+            )
+
+            logger.debug("Login request sent. Awaiting response...")
+            response.raise_for_status() # Lança exceção para erros HTTP 4xx/5xx
+
+            data = response.json()
+            logger.debug("Login response data received.")
+
+            # Tenta pegar o token (ajuste 'accessToken' se o nome do campo for diferente)
+            new_token = data.get('accessToken')
+            if not new_token:
+                # Tenta outros nomes comuns ou loga o erro
+                new_token = data.get('token') or data.get('access_token')
+                if not new_token:
+                    logger.error(f"Token field ('accessToken', 'token', 'access_token') not found in login response keys: {data.keys()}")
+                    return None
+
+            # Calcular expiração baseada no tempo atual + duração
+            # Se a API retornar 'expiresIn', use isso. Caso contrário, use a config.
+            expires_in_seconds = data.get('expiresIn') # DummyJSON não retorna isso, mas muitas APIs sim
+            if expires_in_seconds:
+                 new_expiry_timestamp = time.time() + int(expires_in_seconds)
+                 logger.info(f"Token expiry calculated from API 'expiresIn': {expires_in_seconds}s")
+            else:
+                 expiry_minutes = AUTH_CONFIG.get('token_expiry_minutes', 30) # Default 30 se não configurado
+                 new_expiry_timestamp = time.time() + expiry_minutes * 60
+                 logger.info(f"Token expiry calculated from config 'token_expiry_minutes': {expiry_minutes} min")
+
+
+            # Atualiza o estado compartilhado DENTRO do lock
+            with self.lock:
+                self.token = new_token
+                self.token_expiry = new_expiry_timestamp
+                expiry_dt = datetime.fromtimestamp(new_expiry_timestamp)
+                logger.info(f"Login successful. New token obtained. Expires around: {expiry_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+
+            return new_token
+
+        except requests.exceptions.Timeout:
+            logger.error("Login request timed out.")
+        except requests.exceptions.HTTPError as http_err:
+            response_text = ""
+            status_code = "N/A"
+            if http_err.response is not None:
+                response_text = http_err.response.text
+                status_code = http_err.response.status_code
+            logger.error(f"HTTP error during login: {http_err} - Status: {status_code} - Response: {response_text[:500]}...")
+        except requests.exceptions.RequestException as req_err:
+            logger.error(f"Request error during login: {req_err}")
+        except Exception:
+            # Log full traceback for unexpected errors
+            logger.exception("Unexpected error during login")
+
+        # Em caso de qualquer erro, invalida o token atual para forçar nova tentativa
+        with self.lock:
+            self.token = None
+            self.token_expiry = None
+        return None
+
+    def token_manager(self):
+        """Loop da thread que gerencia a renovação do token."""
+        threading.current_thread().name = "TokenManager"
+        logger.info("TokenManager thread started.")
+
+        # --- Parâmetros de Controle ---
+        # Renovar X segundos ANTES da expiração real
+        renew_threshold = 180  # 3 minutos (ajuste conforme necessidade)
+        # Intervalo máximo de verificação se o token ainda for válido por muito tempo
+        max_sleep_interval = 60 * 5 # Verificar a cada 5 minutos no máximo
+        # Tempo de espera após falha total nas tentativas de login
+        sleep_after_failure = 60 # Espera 1 minuto após falhar todas as tentativas
+        # Configuração de Retentativa com Backoff Exponencial
+        max_login_attempts = 4
+        base_retry_delay = 5 # Começa com 5 segundos
+
+        while not self.stop_event.is_set():
+            try:
+                current_token = None
+                expires_at = 0
+                needs_renewal = False
+                sleep_duration = max_sleep_interval # Default sleep duration
+
+                with self.lock:
+                    current_token = self.token
+                    expires_at = self.token_expiry
+
+                # 1. Determinar se a renovação é necessária
+                if not current_token or not expires_at:
+                    needs_renewal = True
+                    logger.info("No valid token found or expiry unknown. Initiating login.")
+                elif time.time() >= expires_at - renew_threshold:
+                    needs_renewal = True
+                    time_left = expires_at - time.time()
+                    logger.info(f"Token nearing expiry ({time_left:.0f}s remaining, threshold {renew_threshold}s). Initiating renewal...")
+                else:
+                    # Token ainda válido, calcular tempo até a próxima verificação/renovação
+                    time_until_renewal_check = expires_at - time.time() - renew_threshold
+                    # Dormir até a hora de renovar ou pelo intervalo máximo, o que for menor
+                    sleep_duration = max(0, min(time_until_renewal_check, max_sleep_interval))
+                    logger.debug(f"Token valid. Next check/renewal in {sleep_duration:.2f} seconds.")
+
+                # 2. Tentar renovar se necessário
+                if needs_renewal:
+                    login_successful = False
+                    for attempt in range(max_login_attempts):
+                        logger.info(f"Login attempt {attempt + 1}/{max_login_attempts}...")
+                        # Chama login(), que atualiza self.token/self.expiry internamente
+                        new_token_obtained = self.login()
+
+                        if new_token_obtained:
+                            logger.info(f"Login attempt {attempt + 1} successful.")
+                            login_successful = True
+                            # Removido: Colocar na fila
+                            # Precisamos recalcular o sleep_duration com base no novo token
+                            with self.lock:
+                                expires_at = self.token_expiry # Ler o novo expiry time
+                            time_until_renewal_check = expires_at - time.time() - renew_threshold
+                            sleep_duration = max(0, min(time_until_renewal_check, max_sleep_interval))
+                            logger.debug(f"Token renewed. Next check/renewal in {sleep_duration:.2f} seconds.")
+                            break # Sai do loop de retentativas
+
+                        else: # Tentativa de login falhou
+                            if attempt < max_login_attempts - 1:
+                                # Calcular delay com backoff exponencial e jitter
+                                delay = (base_retry_delay * (2 ** attempt)) + random.uniform(0, 1.0)
+                                logger.warning(f"Login attempt {attempt + 1} failed. Retrying in {delay:.2f} seconds...")
+                                wait_interrupted = self.stop_event.wait(delay)
+                                if wait_interrupted:
+                                    logger.info("Stop event received during retry wait. Exiting token manager.")
+                                    return # Sai da thread imediatamente
+                            else:
+                                logger.error(f"Login failed after {max_login_attempts} attempts. Giving up for this cycle.")
+                                # Não quebrou o loop, então login_successful continua False
+
+                    if not login_successful:
+                        logger.warning(f"Token renewal cycle failed after all attempts. Will retry after {sleep_after_failure}s.")
+                        sleep_duration = sleep_after_failure # Espera um tempo definido após falha total
+
+                # 3. Esperar (dormir) até a próxima verificação/renovação
+                logger.debug(f"TokenManager sleeping for {sleep_duration:.2f} seconds...")
+                interrupted = self.stop_event.wait(sleep_duration)
+                if interrupted:
+                    logger.info("Stop event received during sleep. Exiting token manager.")
+                    break # Sai do loop while principal
+
+            except Exception as e:
+                logger.exception("Unexpected error in token manager loop")
+                # Espera um pouco mais após erro inesperado no loop antes de tentar de novo
+                self.stop_event.wait(60) # Espera 1 minuto ou até o stop_event
+
+        logger.info("TokenManager thread finished.")
+
+    def start(self):
+        """Inicia o serviço, faz o login inicial e começa a thread de gerenciamento."""
+        logger.info("Starting token service...")
+        self._initial_login_attempted = True
+        if self.login(): # Tenta o login inicial
+             self._initial_login_successful = True
+             logger.info("Initial login successful.")
+             # Removido: Colocar token inicial na fila
+        else:
+             self._initial_login_successful = False
+             logger.warning("Initial login failed. Token manager will attempt renewal periodically.")
+
+        if not self.thread or not self.thread.is_alive():
+            self.stop_event.clear()
+            # daemon=True: A thread encerra se a aplicação principal sair
+            self.thread = threading.Thread(target=self.token_manager, name="TokenManager", daemon=True)
+            self.thread.start()
+            logger.info("Token service background thread started")
+        else:
+            logger.warning("Token service thread already running.")
+        return True # Indica que o serviço foi iniciado (mesmo se login inicial falhou)
+
+    def stop(self):
+        """Para a thread de gerenciamento de token."""
+        logger.info("Stopping token service...")
+        self.stop_event.set()
+        if self.thread and self.thread.is_alive():
+            # Espera um tempo razoável pela thread terminar
+            self.thread.join(timeout=10)
+            if self.thread.is_alive():
+                logger.warning("TokenManager thread did not stop gracefully within timeout.")
+            else:
+                 logger.info("TokenManager thread joined successfully.")
+        else:
+             logger.info("TokenManager thread was not running.")
+        logger.info("Token service stopped")
+
+    def get_token(self):
+        """
+        Retorna o token de acesso atual armazenado. Thread-safe.
+        Retorna None se nenhum token válido estiver disponível.
+        """
+        # Não precisa mais de wait_timeout, pois não há fila para esperar
+        with self.lock:
+            # Simplesmente retorna o token atual gerenciado pela thread
+            # A thread de background é responsável por mantê-lo válido
+            current_token = self.token
+            if current_token:
+                # Opcional: Adicionar um log se o token retornado estiver perto de expirar
+                # if self.token_expiry and time.time() > self.token_expiry - 60: # Ex: 1 min
+                #    logger.debug("get_token: Returning token that is close to expiry.")
+                # else:
+                    logger.debug("get_token: Returning token from shared state.")
+            else:
+                 logger.warning("get_token: No token available in shared state.")
+            return current_token
+
+    def is_ready(self):
+        """Verifica se o serviço tentou o login inicial e se foi bem-sucedido."""
+        if not self._initial_login_attempted:
+            return False # Ainda não tentou
+        return self._initial_login_successful
+
+# --- Exemplo de Uso ---
+if __name__ == "__main__":
+    # Configurar logging para ver mensagens debug
+    # logging.getLogger().setLevel(logging.DEBUG)
+
+    print("Iniciando Token Service...")
+    token_service = TokenService()
+    token_service.start()
+
+    # Aguardar um pouco para o login inicial (ou usar uma lógica mais robusta)
+    print("Aguardando inicialização (máx 10s)...")
+    for _ in range(10):
+         if token_service.is_ready():
+              print("Token Service pronto (login inicial OK).")
+              break
+         time.sleep(1)
+    else:
+         print("Token Service iniciado, mas login inicial pode ter falhado ou demorado.")
+
+
+    print("\n--- Testando get_token ---")
+    for i in range(3):
+        print(f"\nCiclo {i+1}:")
+        token = token_service.get_token()
+        if token:
+            print(f"  Token obtido: {token[:15]}...") # Mostra só o início
+            # Simular uso do token...
+        else:
+            print("  Falha ao obter token.")
+        print("  Esperando 10 segundos...")
+        time.sleep(10)
+
+    print("\nParando Token Service...")
+    token_service.stop()
+    print("Aplicação de exemplo encerrada.")
